@@ -1,25 +1,23 @@
-import json
-import math
-import os
+import re
 from pathlib import Path
+from collections import Counter
+from math import sqrt
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from openai import OpenAI
 from pydantic import BaseModel
 
-load_dotenv()
-
 BASE_DIR = Path(__file__).resolve().parent
-INDEX_FILE = BASE_DIR / "data" / "index.json"
-
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-5.6-luna")
+DOC_FILE = BASE_DIR / "docs" / "hms_kt.md"
 
 app = FastAPI(title="Hospital HMS RAG")
-app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+
+app.mount(
+    "/static",
+    StaticFiles(directory=BASE_DIR / "static"),
+    name="static"
+)
 
 
 class AskRequest(BaseModel):
@@ -27,94 +25,247 @@ class AskRequest(BaseModel):
     top_k: int = 4
 
 
-def get_client():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+STOPWORDS = set("""
+a an the and or but if then than is are was were be been being
+to of in on for with from by as at into about this that these those
+it its they them their you your what which who when where why how
+can could should would do does did has have had will shall may might
+a patient system hospital management explain tell me
+""".split())
+
+
+def tokenize(text):
+    return [
+        word
+        for word in re.findall(r"[a-zA-Z0-9_]+", text.lower())
+        if word not in STOPWORDS and len(word) > 1
+    ]
+
+
+def load_sections():
+    if not DOC_FILE.exists():
         raise HTTPException(
             status_code=500,
-            detail="OPENAI_API_KEY is missing. Add it to .env or Render environment variables."
+            detail="hms_kt.md file is missing."
         )
-    return OpenAI(api_key=api_key)
+
+    text = DOC_FILE.read_text(encoding="utf-8")
+
+    matches = list(
+        re.finditer(
+            r"(?m)^## (\d+)\.\s+(.+)$",
+            text
+        )
+    )
+
+    sections = []
+
+    for i, match in enumerate(matches):
+
+        start = match.start()
+
+        end = (
+            matches[i + 1].start()
+            if i + 1 < len(matches)
+            else len(text)
+        )
+
+        block = text[start:end].strip()
+
+        sections.append({
+            "number": int(match.group(1)),
+            "title": match.group(2).strip(),
+            "text": block
+        })
+
+    return sections
 
 
-def cosine_similarity(a, b):
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0 or norm_b == 0:
+SECTIONS = load_sections()
+
+
+def similarity(question, document):
+    question_words = tokenize(question)
+    document_words = tokenize(document)
+
+    if not question_words or not document_words:
         return 0.0
-    return dot / (norm_a * norm_b)
+
+    question_count = Counter(question_words)
+    document_count = Counter(document_words)
+
+    dot_product = sum(
+        question_count[word] * document_count[word]
+        for word in question_count
+    )
+
+    question_norm = sqrt(
+        sum(value * value for value in question_count.values())
+    )
+
+    document_norm = sqrt(
+        sum(value * value for value in document_count.values())
+    )
+
+    if question_norm == 0 or document_norm == 0:
+        return 0.0
+
+    return dot_product / (question_norm * document_norm)
 
 
-def load_index():
-    if not INDEX_FILE.exists():
-        raise HTTPException(
-            status_code=500,
-            detail="RAG index is missing. Run: python ingest.py"
+def create_answer(question, selected_sections):
+
+    question_words = set(tokenize(question))
+
+    sentences = []
+
+    for section_score, section in selected_sections:
+
+        parts = re.split(
+            r"(?<=[.!?])\s+|\n",
+            section["text"]
         )
-    return json.loads(INDEX_FILE.read_text(encoding="utf-8"))
+
+        for sentence in parts:
+
+            sentence = sentence.strip()
+
+            if not sentence:
+                continue
+
+            sentence_words = set(tokenize(sentence))
+
+            overlap = len(
+                question_words & sentence_words
+            )
+
+            if overlap > 0:
+
+                sentences.append(
+                    (
+                        overlap,
+                        section_score,
+                        sentence
+                    )
+                )
+
+    sentences.sort(
+        key=lambda item: (
+            item[0],
+            item[1]
+        ),
+        reverse=True
+    )
+
+    answer_sentences = []
+    seen = set()
+
+    for _, _, sentence in sentences:
+
+        key = sentence.lower()
+
+        if key not in seen:
+
+            seen.add(key)
+            answer_sentences.append(sentence)
+
+        if len(answer_sentences) >= 5:
+            break
+
+    if not answer_sentences:
+
+        return (
+            "I could not find that information in "
+            "the Hospital HMS KT document."
+        )
+
+    return (
+        "Based on the Hospital HMS KT document:\n\n"
+        + " ".join(answer_sentences)
+    )
 
 
 @app.get("/")
 def home():
-    return FileResponse(BASE_DIR / "static" / "index.html")
+
+    return FileResponse(
+        BASE_DIR / "static" / "index.html"
+    )
 
 
 @app.get("/health")
 def health():
+
     return {
         "status": "ok",
-        "index_ready": INDEX_FILE.exists()
+        "sections": len(SECTIONS),
+        "mode": "free-local-rag"
     }
 
 
 @app.post("/ask")
 def ask(request: AskRequest):
+
     question = request.question.strip()
+
     if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    client = get_client()
-    index = load_index()
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be empty."
+        )
 
-    query_embedding = client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=question
-    ).data[0].embedding
-
-    ranked = []
-    for item in index:
-        score = cosine_similarity(query_embedding, item["embedding"])
-        ranked.append((score, item))
-
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    selected = ranked[:max(1, min(request.top_k, 8))]
-
-    context = "\n\n".join(
-        f"SECTION: {item['section']}\n{item['text']}"
-        for _, item in selected
+    ranked_sections = sorted(
+        [
+            (
+                similarity(
+                    question,
+                    section["text"]
+                ),
+                section
+            )
+            for section in SECTIONS
+        ],
+        key=lambda item: item[0],
+        reverse=True
     )
 
-    instructions = """You are a Knowledge Transfer assistant for a Hospital Management System.
-Answer only using the supplied KT context.
-If the answer is not available in the context, say:
-"I could not find that information in the Hospital HMS KT document."
-Do not invent patient data, hospital policies, medical advice, or unsupported technical details.
-For technical questions, explain clearly for a new project team member."""
+    selected_sections = ranked_sections[
+        :max(1, min(request.top_k, 8))
+    ]
 
-    response = client.responses.create(
-        model=CHAT_MODEL,
-        instructions=instructions,
-        input=f"KT CONTEXT:\n{context}\n\nQUESTION:\n{question}"
+    if (
+        not selected_sections
+        or selected_sections[0][0] == 0
+    ):
+
+        return {
+            "answer": (
+                "I could not find that information in "
+                "the Hospital HMS KT document."
+            ),
+            "sources": []
+        }
+
+    answer = create_answer(
+        question,
+        selected_sections
     )
 
     return {
-        "answer": response.output_text,
+        "answer": answer,
         "sources": [
             {
-                "section": item["section"],
-                "similarity": round(score, 4)
+                "section": (
+                    f"{section['number']}. "
+                    f"{section['title']}"
+                ),
+                "similarity": round(
+                    score,
+                    4
+                )
             }
-            for score, item in selected
+            for score, section
+            in selected_sections
         ]
     }
