@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: hospital-hms-rag
+    runtime: python
+    buildCommand: pip install -r requirements.txt && python ingest.py
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: CHAT_MODEL
+        value: gpt-5.6-luna
+      - key: EMBEDDING_MODEL
+        value: text-embedding-3-small
